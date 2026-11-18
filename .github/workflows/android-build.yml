@@ -1,0 +1,228 @@
+name: Build & Sign Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'Android build variant (release or debug)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-audit:
+    name: 1. TypeScript, Curriculum & FSRS Unit Test Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run Curriculum Schema Audit & FSRS Unit Tests
+        run: npm run audit:curriculum
+
+      - name: Run TypeScript Strict Typecheck
+        run: npm run typecheck
+
+  build-android-apk:
+    name: 2. Compile & Sign Android Release APK
+    needs: verify-and-audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Java 17 (Eclipse Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK (API 35)
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle Wrapper & Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install Node Dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Stamp Dynamic Android versionCode from CI Run Number
+        env:
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const appJson = JSON.parse(fs.readFileSync("app.json", "utf8"));
+            const verCode = Math.max(1, parseInt(process.env.RUN_NUM || "1", 10));
+            appJson.expo.android.versionCode = verCode;
+            fs.writeFileSync("app.json", JSON.stringify(appJson, null, 2) + "\n");
+            console.log("Stamped android.versionCode =", verCode);
+          '
+
+      - name: Generate Native Android Directory (Expo Prebuild)
+        run: npx expo prebuild --platform android --clean
+
+      - name: Configure Gradle R8 Minification, ARM ABIs & JVM Heap
+        run: |
+          cat << 'EOF' >> android/gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.enableMinifyInReleaseBuilds=true
+          android.enableShrinkResourcesInReleaseBuilds=true
+          reactNativeArchitectures=arm64-v8a,armeabi-v7a
+          EOF
+
+      - name: Prepare Release Keystore & Wire Gradle Signing Config
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using repository secret ANDROID_KEYSTORE_BASE64 for production signing..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+          else
+            echo "Generating self-signed release keystore for immediate APK installation..."
+            keytool -genkeypair -v               -storetype PKCS12               -keystore android/app/release.keystore               -alias stackcraft-key               -keyalg RSA               -keysize 2048               -validity 10000               -storepass stackcraft123               -keypass stackcraft123               -dname "CN=StackCraft, OU=Engineering, O=StackCraft, L=Nairobi, S=Nairobi, C=KE"
+          fi
+
+          # Ensure release buildType uses release.keystore instead of debug keystore
+          node -e '
+            const fs = require("fs");
+            const p = "android/app/build.gradle";
+            let g = fs.readFileSync(p, "utf8");
+            if (!g.includes("MYAPP_UPLOAD_STORE_FILE")) {
+              g = g.replace(
+                /signingConfigs\s*\{/,
+                `signingConfigs {\n        release {\n            storeFile file(System.getenv("MYAPP_UPLOAD_STORE_FILE") ?: "release.keystore")\n            storePassword System.getenv("MYAPP_UPLOAD_STORE_PASSWORD") ?: "stackcraft123"\n            keyAlias System.getenv("MYAPP_UPLOAD_KEY_ALIAS") ?: "stackcraft-key"\n            keyPassword System.getenv("MYAPP_UPLOAD_KEY_PASSWORD") ?: "stackcraft123"\n        }`
+              );
+              g = g.replace(
+                /(buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?)signingConfig\s+signingConfigs\.debug/,
+                "$1signingConfig signingConfigs.release"
+              );
+              fs.writeFileSync(p, g);
+            }
+          '
+
+      - name: Compile Signed APK & AAB via Gradle
+        working-directory: ./android
+        env:
+          MYAPP_UPLOAD_STORE_FILE: release.keystore
+          MYAPP_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'stackcraft-key' }}
+          MYAPP_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'stackcraft123' }}
+          MYAPP_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'stackcraft123' }}
+          BUILD_VARIANT: ${{ inputs.build_variant || 'release' }}
+        run: |
+          chmod +x gradlew
+          if [ "$BUILD_VARIANT" = "debug" ]; then
+            ./gradlew assembleDebug -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+          else
+            ./gradlew assembleRelease bundleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+          fi
+
+      - name: Stage Canonical & Commit-Stamped APK/AAB Artifacts
+        env:
+          BUILD_VARIANT: ${{ inputs.build_variant || 'release' }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          if [ "$BUILD_VARIANT" = "debug" ]; then
+            SRC_APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          else
+            SRC_APK="android/app/build/outputs/apk/release/app-release.apk"
+          fi
+          cp "$SRC_APK" stackcraft-latest.apk
+          cp "$SRC_APK" "stackcraft-v1.0.0-${SHORT_SHA}.apk"
+          if [ -f "android/app/build/outputs/bundle/release/app-release.aab" ]; then
+            cp "android/app/build/outputs/bundle/release/app-release.aab" stackcraft-latest.aab
+          fi
+
+      - name: Upload Installable Android APK to Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackcraft-android-release-apk
+          overwrite: true
+          path: |
+            stackcraft-latest.apk
+            stackcraft-v1.0.0-*.apk
+            stackcraft-latest.aab
+          retention-days: 30
+
+      - name: Upload APK to GitHub Releases & Replace Previous Release APK
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          SHA: ${{ github.sha }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          APK_SHA256=$(sha256sum stackcraft-latest.apk | awk '{print $1}')
+          APK_SIZE=$(du -h stackcraft-latest.apk | awk '{print $1}')
+          RELEASE_TAG="latest"
+          RELEASE_TITLE="StackCraft Android APK (Build #${RUN_NUM} — ${SHORT_SHA})"
+
+          # Purge previous rolling release & tag so the new APK cleanly replaces the old one
+          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Removing previous release '$RELEASE_TAG' to replace old APK assets..."
+            gh release delete "$RELEASE_TAG" --repo "$REPO" --cleanup-tag --yes || true
+          fi
+
+          ASSETS=("stackcraft-latest.apk" "stackcraft-v1.0.0-${SHORT_SHA}.apk")
+          if [ -f "stackcraft-latest.aab" ]; then
+            ASSETS+=("stackcraft-latest.aab")
+          fi
+
+          NOTES="Automated Android release APK built from commit \`${SHORT_SHA}\` (Android \`versionCode: ${RUN_NUM}\`, ABIs: \`arm64-v8a, armeabi-v7a\`).
+
+          - **Download**: \`stackcraft-latest.apk\` (${APK_SIZE})
+          - **SHA-256 Checksum**: \`${APK_SHA256}\`"
+
+          gh release create "$RELEASE_TAG" "${ASSETS[@]}"             --repo "$REPO"             --title "$RELEASE_TITLE"             --target "$SHA"             --latest             --notes "$NOTES"
+
+          # If triggered by an explicit version tag (v*.*.*), also publish/overwrite that versioned release
+          if [ "$IS_TAG" = "true" ] && [ "$REF_NAME" != "$RELEASE_TAG" ]; then
+            if gh release view "$REF_NAME" --repo "$REPO" >/dev/null 2>&1; then
+              gh release delete "$REF_NAME" --repo "$REPO" --yes || true
+            fi
+            gh release create "$REF_NAME" "${ASSETS[@]}"               --repo "$REPO"               --title "StackCraft ${REF_NAME} (${SHORT_SHA})"               --target "$SHA"               --generate-notes
+          fi
