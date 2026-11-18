@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
 import { AiAuditorLab, CodeLanguage } from '../data/types';
-import { COLORS, androidRipple, triggerHaptic } from '../theme';
+import { COLORS, FONTS, androidRipple, triggerHaptic } from '../theme';
 import { DynamicIcon } from '../components/DynamicIcon';
 
 interface Props {
@@ -28,6 +28,7 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
   }, [language, lineFound, lab]);
 
   const handleTapLine = (lineNumber: number) => {
+    if (lineFound) return;
     setTappedLine(lineNumber);
     setAttempts((a) => a + 1);
     if (lineNumber === targetBugLine) {
@@ -40,9 +41,24 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
 
   const selectedPatch = lab.patchOptions.find((p) => p.id === selectedPatchId);
   const isPatchCorrect = Boolean(selectedPatch?.isCorrect);
+  const addedCount = lines.filter((l) => l.type === 'added').length;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {/* 2-Phase Mission Stepper Banner */}
+      <View style={styles.phaseBar}>
+        <View style={[styles.phaseStep, !lineFound && styles.phaseStepActive]}>
+          <Text style={[styles.phaseStepText, !lineFound && styles.phaseStepTextActive]}>
+            {lineFound ? '✓ 1. Flaw Line Isolated' : '1. Tap Vulnerable Diff Line'}
+          </Text>
+        </View>
+        <View style={[styles.phaseStep, lineFound && styles.phaseStepActive]}>
+          <Text style={[styles.phaseStepText, lineFound && styles.phaseStepTextActive]}>
+            {isPatchCorrect ? '✓ 2. Patch Verified' : '2. Select Production Patch'}
+          </Text>
+        </View>
+      </View>
+
       <View style={styles.prBanner}>
         <DynamicIcon name="git-pull-request" size={18} color={COLORS.accentAmber} />
         <View style={{ flex: 1 }}>
@@ -53,43 +69,83 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
 
       <Text style={styles.instruction}>{lab.symptomQuestion}</Text>
 
-      {/* Interactive PR Diff Lines */}
+      {/* Interactive PR Diff Lines with GitHub/GitLab Header Chrome */}
       <View style={styles.diffContainer}>
+        <View style={styles.diffHeader}>
+          <Text style={styles.diffFileLabel}>
+            {language === 'typescript'
+              ? 'pr_diff.ts'
+              : language === 'python'
+              ? 'pr_diff.py'
+              : 'pr_diff.c'}
+          </Text>
+          <View style={styles.diffHeaderRight}>
+            <Text style={styles.diffAddedCount}>+{addedCount}</Text>
+            <View style={styles.unverifiedPill}>
+              <Text style={styles.unverifiedText}>
+                {lineFound ? 'BUG ISOLATED' : 'TAP LINE TO AUDIT'}
+              </Text>
+            </View>
+          </View>
+        </View>
+
         {lines.map((line) => {
           const isTapped = tappedLine === line.lineNumber;
           const isBug = line.lineNumber === targetBugLine;
+          const isBugHighlighted = (lineFound && isBug) || (isTapped && isBug);
+          const isWrongTap = isTapped && !isBug;
+          const diffPrefix =
+            line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ';
           return (
             <Pressable
               key={line.lineNumber}
+              disabled={lineFound}
+              accessibilityRole="button"
+              accessibilityState={{
+                selected: isBugHighlighted,
+                disabled: lineFound,
+              }}
+              accessibilityLabel={`Line ${line.lineNumber}, ${line.type} line: ${line.content}${isBugHighlighted ? ', identified vulnerability line' : ''}`}
               onPress={() => handleTapLine(line.lineNumber)}
               android_ripple={androidRipple()}
               style={[
                 styles.diffRow,
                 line.type === 'added' && styles.diffAdded,
-                (lineFound && isBug) || (isTapped && isBug) ? styles.diffBugFound : null,
-                isTapped && !isBug && styles.diffWrongLine,
+                line.type === 'removed' && styles.diffRemoved,
+                isBugHighlighted ? styles.diffBugFound : null,
+                isWrongTap && styles.diffWrongLine,
               ]}
             >
               <Text style={styles.lineNum}>{line.lineNumber}</Text>
-              <Text style={styles.diffSign}>
-                {line.type === 'added' ? '+' : ' '}
+              <Text
+                style={[
+                  styles.diffSign,
+                  line.type === 'removed' && styles.diffSignRemoved,
+                ]}
+              >
+                {diffPrefix}
               </Text>
               <Text style={styles.codeText}>{line.content}</Text>
+              {isBugHighlighted && (
+                <View style={styles.bugTag}>
+                  <Text style={styles.bugTagText}>FLAW</Text>
+                </View>
+              )}
             </Pressable>
           );
         })}
       </View>
 
       {tappedLine !== null && !lineFound && (
-        <View style={styles.feedbackWarn}>
+        <View style={styles.feedbackWarn} accessibilityLiveRegion="polite">
           <Text style={styles.feedbackWarnText}>
-            Line {tappedLine} is not the primary vulnerability or bottleneck. Inspect the loop or non-atomic state write and tap the exact offending line.
+            Line {tappedLine} is not the primary flaw ({lab.flawCategory}). Re-read the symptom prompt above and tap the exact offending line.
           </Text>
         </View>
       )}
 
       {lineFound && (
-        <View style={styles.patchSection}>
+        <View style={styles.patchSection} accessibilityLiveRegion="polite">
           <View style={styles.flawBadgeRow}>
             <DynamicIcon name="alert-triangle" size={16} color={COLORS.accentAmber} />
             <Text style={styles.flawCategory}>{lab.flawCategory}</Text>
@@ -101,8 +157,19 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
             return (
               <Pressable
                 key={patch.id}
+                disabled={isPatchCorrect}
+                accessibilityRole="button"
+                accessibilityState={{
+                  selected: isSelected,
+                  disabled: isPatchCorrect,
+                }}
+                accessibilityLabel={`Patch option: ${patch.label}`}
                 onPress={() => {
+                  if (isPatchCorrect) return;
                   triggerHaptic(patch.isCorrect ? 'success' : 'warning');
+                  if (!patch.isCorrect) {
+                    setAttempts((a) => a + 1);
+                  }
                   setSelectedPatchId(patch.id);
                 }}
                 android_ripple={androidRipple()}
@@ -113,15 +180,17 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
                 ]}
               >
                 <Text style={styles.patchLabel}>{patch.label}</Text>
-                <View style={styles.patchCodeBox}>
-                  <Text style={styles.patchCode}>{patch.codePatch}</Text>
-                </View>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  <View style={styles.patchCodeBox}>
+                    <Text style={styles.patchCode}>{patch.codePatch}</Text>
+                  </View>
+                </ScrollView>
               </Pressable>
             );
           })}
 
           {selectedPatch && (
-            <View style={styles.deepDiveBox}>
+            <View style={styles.deepDiveBox} accessibilityLiveRegion="polite">
               <Text style={styles.feedbackText}>{selectedPatch.feedback}</Text>
               {selectedPatch.isCorrect && (
                 <Text style={styles.deepDiveText}>{lab.deepDiveExplanation}</Text>
@@ -131,6 +200,8 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
 
           {isPatchCorrect && (
             <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Approve patched pull request and claim XP"
               onPress={() => {
                 const accuracy = Math.max(50, Math.round((1 / Math.max(1, attempts)) * 100));
                 onComplete(accuracy);
@@ -151,6 +222,34 @@ export function AiAuditorEngine({ lab, language, onComplete }: Props) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bg },
   content: { padding: 16, paddingBottom: 48 },
+  phaseBar: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  phaseStep: {
+    flex: 1,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 8,
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+    alignItems: 'center',
+  },
+  phaseStepActive: {
+    borderColor: COLORS.accentAmber,
+    backgroundColor: 'rgba(245, 158, 11, 0.14)',
+  },
+  phaseStepText: {
+    color: COLORS.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+    fontFamily: FONTS.mono,
+  },
+  phaseStepTextActive: {
+    color: COLORS.textPrimary,
+  },
   prBanner: {
     flexDirection: 'row',
     gap: 12,
@@ -178,14 +277,56 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     marginBottom: 14,
   },
+  diffHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+  },
+  diffFileLabel: {
+    color: COLORS.textSecondary,
+    fontSize: 11,
+    fontFamily: FONTS.mono,
+    fontWeight: '700',
+  },
+  diffHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  diffAddedCount: {
+    color: COLORS.accentEmerald,
+    fontSize: 11,
+    fontFamily: FONTS.mono,
+    fontWeight: '700',
+  },
+  unverifiedPill: {
+    backgroundColor: 'rgba(245, 158, 11, 0.18)',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  unverifiedText: {
+    color: COLORS.accentAmber,
+    fontSize: 9.5,
+    fontFamily: FONTS.mono,
+    fontWeight: '700',
+  },
   diffRow: {
     flexDirection: 'row',
-    paddingVertical: 7,
+    alignItems: 'center',
+    minHeight: 44,
+    paddingVertical: 9,
     paddingHorizontal: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#1E293B66',
   },
   diffAdded: { backgroundColor: 'rgba(16, 185, 129, 0.08)' },
+  diffRemoved: { backgroundColor: 'rgba(239, 68, 68, 0.08)' },
   diffBugFound: {
     backgroundColor: 'rgba(245, 158, 11, 0.28)',
     borderLeftWidth: 4,
@@ -194,9 +335,23 @@ const styles = StyleSheet.create({
   diffWrongLine: {
     backgroundColor: 'rgba(239, 68, 68, 0.22)',
   },
-  lineNum: { width: 24, color: COLORS.textMuted, fontFamily: 'monospace', fontSize: 12 },
-  diffSign: { width: 16, color: COLORS.accentEmerald, fontFamily: 'monospace', fontSize: 12 },
-  codeText: { color: COLORS.textPrimary, fontFamily: 'monospace', fontSize: 12.5, flex: 1 },
+  lineNum: { width: 24, color: COLORS.textMuted, fontFamily: FONTS.mono, fontSize: 12 },
+  diffSign: { width: 16, color: COLORS.accentEmerald, fontFamily: FONTS.mono, fontSize: 12 },
+  diffSignRemoved: { color: COLORS.accentRose },
+  codeText: { color: COLORS.textPrimary, fontFamily: FONTS.mono, fontSize: 12.5, flex: 1 },
+  bugTag: {
+    backgroundColor: COLORS.accentAmberDark,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    marginLeft: 6,
+  },
+  bugTagText: {
+    color: '#FFFFFF',
+    fontSize: 9.5,
+    fontFamily: FONTS.mono,
+    fontWeight: '700',
+  },
   feedbackWarn: {
     backgroundColor: 'rgba(239, 68, 68, 0.14)',
     borderRadius: 8,
@@ -240,8 +395,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.codeBg,
     borderRadius: 6,
     padding: 8,
+    minWidth: '100%',
   },
-  patchCode: { color: '#93C5FD', fontFamily: 'monospace', fontSize: 12 },
+  patchCode: { color: '#93C5FD', fontFamily: FONTS.mono, fontSize: 12 },
   deepDiveBox: {
     backgroundColor: COLORS.surfaceElevated,
     borderRadius: 8,
@@ -251,8 +407,9 @@ const styles = StyleSheet.create({
   feedbackText: { color: COLORS.textPrimary, fontSize: 13.5, lineHeight: 19, marginBottom: 6 },
   deepDiveText: { color: COLORS.textSecondary, fontSize: 13, lineHeight: 19 },
   completeBtn: {
-    backgroundColor: COLORS.accentEmerald,
+    backgroundColor: COLORS.accentEmeraldDark,
     borderRadius: 10,
+    minHeight: 48,
     paddingVertical: 14,
     flexDirection: 'row',
     justifyContent: 'center',

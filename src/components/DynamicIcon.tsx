@@ -20,7 +20,21 @@ export type IconName =
   | 'git-pull-request'
   | 'server'
   | 'lock'
-  | 'unlock';
+  | 'unlock'
+  | 'search'
+  | 'filter'
+  | 'bookmark'
+  | 'trending-up'
+  | 'clock'
+  | 'eye'
+  | 'sliders'
+  | 'database'
+  | 'globe'
+  | 'refresh-cw'
+  | 'check'
+  | 'x'
+  | 'info'
+  | 'star';
 
 interface DynamicIconProps {
   name: IconName;

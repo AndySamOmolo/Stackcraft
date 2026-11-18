@@ -3,24 +3,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 
-// Load and transpile src/lib/fsrs.ts stripped of TS type annotations so it runs in zero-dependency Node
 const fsrsPath = path.resolve('src/lib/fsrs.ts');
 const tsCode = fs.readFileSync(fsrsPath, 'utf8');
 
-const jsCode = tsCode
-  .replace(/export type .*?;/g, '')
-  .replace(/export interface FSRSCardState \{[\s\S]*?\}/g, '')
-  .replace(/export function /g, 'function ')
-  .replace(/: FSRSCardState/g, '')
-  .replace(/: Rating/g, '')
-  .replace(/: string/g, '')
-  .replace(/: number/g, '')
-  .replace(/: boolean/g, '') +
+// Robustly strip TypeScript type declarations and parameter/return type annotations (CODE-02)
+const jsCode =
+  tsCode
+    .replace(/export\s+type\s+[\s\S]*?;/g, '')
+    .replace(/export\s+interface\s+\w+\s*\{[\s\S]*?\}/g, '')
+    .replace(/export\s+function\s+/g, 'function ')
+    .replace(/:\s*(?:FSRSCardState|Rating|string|number|boolean|Date|void)(?:\s*\|\s*null)?/g, '') +
   '\nmodule.exports = { createInitialCardState, computeRetrievability, scheduleNextReview, isCardDue };';
 
 const sandbox = { module: { exports: {} }, Date, Math, Number };
 vm.runInNewContext(jsCode, sandbox, { filename: 'fsrs.ts' });
-const { createInitialCardState, computeRetrievability, scheduleNextReview, isCardDue } = sandbox.module.exports;
+const { createInitialCardState, computeRetrievability, scheduleNextReview, isCardDue } =
+  sandbox.module.exports;
 
 const t0 = new Date('2026-11-17T12:00:00Z');
 const init = createInitialCardState('fc-test-1', t0);
@@ -57,4 +55,6 @@ const rLapse = scheduleNextReview(rSpaced, 1, tDue);
 assert.equal(rLapse.lapses, 1);
 assert.ok(rLapse.stability < rSpaced.stability);
 
-console.log('[PASS] FSRS v4.5 unit tests succeeded: initial state, 90% retrievability curve, same-day anti-spam damping, and lapse recovery verified.');
+console.log(
+  '[PASS] FSRS v4.5 unit tests succeeded: initial state, 90% retrievability curve, same-day anti-spam damping, and lapse recovery verified.'
+);

@@ -17,7 +17,7 @@ export interface StackVariable {
 export interface StackFrame {
   id: string;
   functionName: string;
-  line: number;
+  line: number | Record<CodeLanguage, number>;
   variables: StackVariable[];
 }
 
